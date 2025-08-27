@@ -1,11 +1,16 @@
 """
-SLM_test.py - 测试Meadowlark SLM连接和显示
+SLM_test_enhanced.py - 测试Meadowlark SLM连接和显示（支持BMP文件）
+增强版本：支持读取和显示BMP文件
 """
 
 import numpy as np
 from ctypes import *
 import time
 import matplotlib.pyplot as plt
+from PIL import Image
+import os
+from tkinter import filedialog
+import tkinter as tk
 
 
 class SLM_Tester:
@@ -38,7 +43,7 @@ class SLM_Tester:
             )
 
             if constructed_okay.value == 0:
-                print("✅ SLM SDK initialized successfully")
+                print("✅ SLM initialized successfully")
                 print(f"   Found {num_boards_found.value} SLM board(s)")
             else:
                 print("❌ Failed to initialize SLM SDK")
@@ -69,7 +74,10 @@ class SLM_Tester:
         lut_base = "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\LUT Files\\"
 
         if self.width == 512:
-            lut_file = lut_base + "512x512_linearVoltage.LUT"
+            if self.depth == 8:
+                lut_file = lut_base + "512x512_linearVoltage.LUT"
+            else:  # 16-bit
+                lut_file = lut_base + "512x512_16bit_linearVoltage.LUT"
         elif self.width == 1920:
             lut_file = lut_base + "1920x1152_linearVoltage.LUT"
         elif self.width == 1024:
@@ -80,19 +88,131 @@ class SLM_Tester:
         self.slm_lib.Load_LUT_file(self.board_number, lut_file.encode())
         print(f"   Loaded LUT: {lut_file.split('')[-1]}")
 
-    def display_pattern(self, pattern_type="checkerboard", param=20):
+    def load_bmp_file(self, filepath=None):
         """
-        显示测试图案
+        加载BMP文件并转换为SLM格式
 
-        pattern_type: 'checkerboard', 'gradient', 'blazed_grating', 'vortex'
+        filepath: BMP文件路径，如果为None则打开文件选择对话框
+        """
+        if not filepath:
+            # 创建一个隐藏的根窗口
+            root = tk.Tk()
+            root.withdraw()
+
+            # 打开文件选择对话框
+            filepath = filedialog.askopenfilename(
+                title="Select BMP file",
+                filetypes=[("BMP files", "*.bmp"), ("All files", "*.*")]
+            )
+
+            root.destroy()
+
+            if not filepath:
+                print("No file selected")
+                return None
+
+        try:
+            # 使用PIL读取图像
+            img = Image.open(filepath)
+            print(f"📁 Loaded image: {os.path.basename(filepath)}")
+            print(f"   Original size: {img.size}")
+            print(f"   Mode: {img.mode}")
+
+            # 转换为灰度图像（如果不是）
+            if img.mode != 'L':
+                img = img.convert('L')
+                print("   Converted to grayscale")
+
+            # 调整图像大小以匹配SLM分辨率
+            if img.size != (self.width, self.height):
+                # 提供两种调整选项
+                print(f"\n   Image size doesn't match SLM resolution ({self.width}x{self.height})")
+                print("   Resizing options:")
+                print("   1. Stretch to fit (may distort)")
+                print("   2. Fit and pad with black")
+                print("   3. Center crop")
+
+                choice = input("   Select option (1-3, default=2): ") or "2"
+
+                if choice == "1":
+                    # 拉伸以适应
+                    img = img.resize((self.width, self.height), Image.LANCZOS)
+                    print("   Image stretched to fit")
+                elif choice == "3":
+                    # 中心裁剪
+                    img = self._center_crop(img, self.width, self.height)
+                    print("   Image center cropped")
+                else:
+                    # 适应并填充
+                    img = self._fit_and_pad(img, self.width, self.height)
+                    print("   Image fitted and padded")
+
+            # 转换为numpy数组（归一化到0-1）
+            pattern = np.array(img, dtype=np.float64) / 255.0
+
+            return pattern
+
+        except Exception as e:
+            print(f"❌ Error loading BMP file: {e}")
+            return None
+
+    def _fit_and_pad(self, img, target_width, target_height):
+        """适应图像到目标尺寸并用黑色填充"""
+        # 计算缩放比例
+        scale = min(target_width / img.width, target_height / img.height)
+        new_width = int(img.width * scale)
+        new_height = int(img.height * scale)
+
+        # 缩放图像
+        img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+
+        # 创建黑色背景
+        new_img = Image.new('L', (target_width, target_height), 0)
+
+        # 计算粘贴位置（居中）
+        paste_x = (target_width - new_width) // 2
+        paste_y = (target_height - new_height) // 2
+
+        # 粘贴缩放后的图像
+        new_img.paste(img_resized, (paste_x, paste_y))
+
+        return new_img
+
+    def _center_crop(self, img, target_width, target_height):
+        """从中心裁剪图像"""
+        # 首先缩放图像使其最小维度匹配目标
+        scale = max(target_width / img.width, target_height / img.height)
+        new_width = int(img.width * scale)
+        new_height = int(img.height * scale)
+
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+
+        # 计算裁剪区域
+        left = (new_width - target_width) // 2
+        top = (new_height - target_height) // 2
+        right = left + target_width
+        bottom = top + target_height
+
+        return img.crop((left, top, right, bottom))
+
+    def display_pattern(self, pattern_type="checkerboard", param=20, bmp_filepath=None):
+        """
+        显示测试图案或BMP文件
+
+        pattern_type: 'checkerboard', 'gradient', 'blazed_grating', 'vortex', 'bmp_file'
         param: 图案参数（如棋盘格大小、光栅周期等）
+        bmp_filepath: BMP文件路径（仅当pattern_type='bmp_file'时使用）
         """
         if not self.slm_initialized:
             print("❌ SLM not initialized")
             return
 
-        # 生成图案
-        if pattern_type == "checkerboard":
+        # 生成或加载图案
+        if pattern_type == "bmp_file":
+            pattern = self.load_bmp_file(bmp_filepath)
+            if pattern is None:
+                return
+        elif pattern_type == "checkerboard":
             pattern = self._generate_checkerboard(param)
         elif pattern_type == "gradient":
             pattern = self._generate_gradient()
@@ -101,7 +221,7 @@ class SLM_Tester:
         elif pattern_type == "vortex":
             pattern = self._generate_vortex(param)
         else:
-            print(f"Unknown pattern type: {pattern_type}")
+            print(f"❌ Unknown pattern type: {pattern_type}")
             return
 
         # 转换为灰度值
@@ -139,8 +259,8 @@ class SLM_Tester:
 
             # 显示预览
             plt.figure(figsize=(8, 8))
-            plt.imshow(pattern, cmap='gray')
-            plt.title(f'{pattern_type.capitalize()} Pattern')
+            plt.imshow(pattern, cmap='gray', vmin=0, vmax=1)
+            plt.title(f'{pattern_type.replace("_", " ").title()} Pattern')
             plt.colorbar()
             plt.show()
 
@@ -150,7 +270,8 @@ class SLM_Tester:
         for i in range(0, self.height, square_size * 2):
             for j in range(0, self.width, square_size * 2):
                 pattern[i:i + square_size, j:j + square_size] = 1
-                pattern[i + square_size:i + 2 * square_size, j + square_size:j + 2 * square_size] = 1
+                pattern[i + square_size:i + 2 * square_size,
+                j + square_size:j + 2 * square_size] = 1
         return pattern
 
     def _generate_gradient(self):
@@ -163,11 +284,12 @@ class SLM_Tester:
     def _generate_blazed_grating(self, period):
         """生成闪耀光栅"""
         x = np.arange(self.width)
-        pattern = (x % period) / period
-        return np.tile(pattern, (self.height, 1))
+        grating = (x % period) / period
+        pattern = np.tile(grating, (self.height, 1))
+        return pattern
 
     def _generate_vortex(self, charge):
-        """生成涡旋相位图案"""
+        """生成涡旋相位板"""
         cx, cy = self.width // 2, self.height // 2
         x = np.arange(self.width) - cx
         y = np.arange(self.height) - cy
@@ -186,7 +308,7 @@ class SLM_Tester:
 # 测试脚本
 def test_slm():
     print("=" * 50)
-    print("SLM CONNECTION TEST")
+    print("SLM CONNECTION AND DISPLAY TEST")
     print("=" * 50)
 
     # 初始化
@@ -202,10 +324,11 @@ def test_slm():
         print("1. Checkerboard")
         print("2. Gradient")
         print("3. Blazed Grating")
-        print("4. Vortex")
-        print("5. Exit")
+        print("4. Vortex Phase Plate")
+        print("5. Load BMP File")
+        print("6. Exit")
 
-        choice = input("Enter choice (1-5): ")
+        choice = input("Enter choice (1-6): ")
 
         if choice == '1':
             size = int(input("Square size (pixels, default=20): ") or "20")
@@ -216,10 +339,15 @@ def test_slm():
             period = int(input("Grating period (pixels, default=10): ") or "10")
             slm.display_pattern("blazed_grating", period)
         elif choice == '4':
-            charge = int(input("Vortex charge (default=1): ") or "1")
+            charge = int(input("Topological charge (default=1): ") or "1")
             slm.display_pattern("vortex", charge)
         elif choice == '5':
+            print("\n📁 Select BMP file to display...")
+            slm.display_pattern("bmp_file")
+        elif choice == '6':
             break
+        else:
+            print("Invalid choice, please try again")
 
     # 清理
     slm.cleanup()
