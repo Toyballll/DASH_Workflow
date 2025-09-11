@@ -18,8 +18,6 @@ class DASH_Meadowlark_System:
                  f: float = 0.3,
                  P: int = 5):
         """
-        初始化DASH系统
-
         Parameters:
         -----------
         slm_sdk_path : str
@@ -122,7 +120,7 @@ class DASH_Meadowlark_System:
             raise ValueError(f"Unsupported SLM size: {self.slm_width}x{self.slm_height}")
 
     def _precompute_modes(self):
-        """预计算所有平面波光栅模式"""
+        """phase grating pattern"""
         # 在矫正区域内生成模式
         self.modes = np.zeros((self.N, self.N, self.N_modes))
 
@@ -231,9 +229,7 @@ class DASH_Meadowlark_System:
             return self.pmt.measure(accumulation_time_ms)
 
     def _update_correction(self, mode_idx: int, signals: np.ndarray):
-        """
-        根据测量信号更新校正（DASH核心算法）
-        """
+
         # 相位步进干涉测量
         complex_sum = np.sum(np.sqrt(signals) * np.exp(-1j * self.theta))
 
@@ -254,7 +250,6 @@ class DASH_Meadowlark_System:
                        save_progress: bool = True):
         """
         运行DASH矫正
-
         Parameters:
         -----------
         iterations : int
