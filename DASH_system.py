@@ -1,406 +1,262 @@
+"""
+DASH Implementation - SLM Control and PMT Signal Processing
+Hardware: NI PCI-6110 DAQ, Meadowlark SLM, PMT
+"""
+
 import numpy as np
 from ctypes import *
+import nidaqmx
+from nidaqmx.constants import TerminalConfiguration, AcquisitionType, LineGrouping
+from scipy import signal
+import matplotlib.pyplot as plt
 import time
-from typing import Optional, Callable
-import threading
-import queue
 
 
-class DASH_Meadowlark_System:
-    """
-    DASH矫正系统 - 集成Meadowlark SLM
-    """
+class DASH_System:
+    def __init__(self):
+        # DAQ configuration
+        self.device_name = "Dev2"
+        self.trigger_line = "port0/line0"  # P0.0 -> SLM Trigger
+        self.pmt_channel = "ai0"  # AI0 <- PMT signal
 
-    def __init__(self,
-                 slm_sdk_path: str = "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\SDK\\",
-                 pmt_device=None,
-                 N_modes: int = 225,
-                 f: float = 0.3,
-                 P: int = 5):
-        """
-        Parameters:
-        -----------
-        slm_sdk_path : str
-            Blink SDK路径
-        pmt_device : object
-            PMT设备接口
-        N_modes : int
-            矫正模式数量
-        f : float
-            功率分配比例
-        P : int
-            相位步进数
-        """
-        self.N_modes = N_modes
-        self.N = int(np.sqrt(N_modes))  # 假设方形区域
-        self.f = f
-        self.P = P
-        self.pmt = pmt_device
+        # Sampling parameters
+        self.sample_rate = 10000  # 10kHz sampling
+        self.integration_samples = 50  # 5ms = 50 samples at 10kHz
 
-        # 相位步进值
-        self.theta = np.linspace(0, 2 * np.pi, P, endpoint=False)
+        # SLM parameters
+        self.slm_lib = None
+        self.board_number = c_uint(1)
+        self.image_size = 1024 * 1024
+        self.n_modes = 225  # 15x15 modes
 
-        # 初始化SLM
-        self._init_slm(slm_sdk_path)
+        # Phase stepping parameters
+        self.n_phase_steps = 5
+        self.phase_values = np.linspace(0, 2 * np.pi, self.n_phase_steps, endpoint=False)
 
-        # 预计算所有模式
-        self._precompute_modes()
+        # DASH parameters
+        self.f = 0.3  # Power fraction for test mode
+        self.correction_phase = np.zeros(self.n_modes)
 
-        # 初始化校正场
-        self.C = np.ones((self.slm_height, self.slm_width), dtype=complex)
+        # 50Hz notch filter coefficients
+        b, a = signal.iirnotch(50.0, 30.0, self.sample_rate)
+        self.notch_b = b
+        self.notch_a = a
 
-        # 性能优化：预分配缓冲区
-        self.slm_buffer = np.zeros(self.slm_height * self.slm_width * self.bytes_per_pixel,
-                                   dtype=np.uint8, order='C')
-
-    def _init_slm(self, sdk_path):
-        """初始化Meadowlark SLM"""
-        # 加载DLL
-        cdll.LoadLibrary(sdk_path + "Blink_C_wrapper")
+    def init_slm(self):
+        """Initialize SLM hardware"""
+        cdll.LoadLibrary("C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\SDK\\Blink_C_wrapper")
         self.slm_lib = CDLL("Blink_C_wrapper")
 
-        # 初始化参数
-        bit_depth = c_uint(12)
         num_boards_found = c_uint(0)
-        constructed_okay = c_uint(-1)
-        is_nematic_type = c_bool(1)
-        RAM_write_enable = c_bool(1)
-        use_GPU = c_bool(1)
-        max_transients = c_uint(20)
-        self.board_number = c_uint(1)
+        self.slm_lib.Create_SDK(c_uint(12), byref(num_boards_found), byref(c_uint(-1)),
+                                c_bool(1), c_bool(1), c_bool(1), c_uint(20), 0)
 
-        # 创建SDK实例
-        self.slm_lib.Create_SDK(
-            bit_depth,
-            byref(num_boards_found),
-            byref(constructed_okay),
-            is_nematic_type,
-            RAM_write_enable,
-            use_GPU,
-            max_transients,
-            0
-        )
+        if num_boards_found.value < 1:
+            raise Exception("SLM not found")
 
-        if constructed_okay.value != 0:
-            raise RuntimeError("Failed to initialize Blink SDK")
+        self.slm_lib.Load_LUT_file(self.board_number,
+                                   b"C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\LUT Files\\1024x1024_linearVoltage.LUT")
 
-        # 获取SLM参数
-        self.slm_height = self.slm_lib.Get_image_height(self.board_number)
-        self.slm_width = self.slm_lib.Get_image_width(self.board_number)
-        self.bit_depth = self.slm_lib.Get_image_depth(self.board_number)
-        self.bytes_per_pixel = self.bit_depth // 8
+        print(f"SLM initialized")
+        return True
 
-        print(f"SLM initialized: {self.slm_width}x{self.slm_height}, {self.bit_depth} bits")
+    def generate_mode_pattern(self, mode_idx, phase_step):
+        """Generate phase pattern for given mode and phase step"""
+        # Simple grating pattern for mode m
+        nx = mode_idx % 15
+        ny = mode_idx // 15
 
-        # 加载线性LUT（您应该使用校准后的相位LUT）
-        lut_file = self._get_lut_file()
-        self.slm_lib.Load_LUT_file(self.board_number, lut_file.encode())
+        x = np.linspace(-np.pi, np.pi, 1024)
+        y = np.linspace(-np.pi, np.pi, 1024)
+        X, Y = np.meshgrid(x, y)
 
-        # 设置SLM写入参数
-        self.wait_for_trigger = c_uint(0)
-        self.flip_immediate = c_uint(0)
-        self.output_pulse_flip = c_uint(0)
-        self.output_pulse_refresh = c_uint(0)
-        self.timeout_ms = c_uint(5000)
+        # Mode phase pattern
+        mode_phase = (nx - 7) * X / 7 + (ny - 7) * Y / 7
 
-    def _get_lut_file(self):
-        """根据SLM尺寸选择LUT文件"""
-        base_path = "C:\\Program Files\\Meadowlark Optics\\Blink OverDrive Plus\\LUT Files\\"
-
-        if self.slm_width == 512:
-            if self.bit_depth == 8:
-                return base_path + "512x512_linearVoltage.LUT"
-            else:
-                return base_path + "512x512_16bit_linearVoltage.LUT"
-        elif self.slm_width == 1920:
-            return base_path + "1920x1152_linearVoltage.LUT"
-        elif self.slm_width == 1024:
-            return base_path + "1024x1024_linearVoltage.LUT"
+        # Combine with correction using DASH formula
+        if mode_idx == 0:
+            # First mode, no correction yet
+            combined = np.sqrt(self.f) * np.exp(1j * (mode_phase + self.phase_values[phase_step]))
         else:
-            raise ValueError(f"Unsupported SLM size: {self.slm_width}x{self.slm_height}")
+            # Add correction phase
+            correction = self.get_correction_pattern()
+            combined = (np.sqrt(self.f) * np.exp(1j * (mode_phase + self.phase_values[phase_step])) +
+                        np.sqrt(1 - self.f) * np.exp(1j * correction))
 
-    def _precompute_modes(self):
-        """phase grating pattern"""
-        # 在矫正区域内生成模式
-        self.modes = np.zeros((self.N, self.N, self.N_modes))
+        # Convert to phase-only pattern (0-255)
+        phase_pattern = np.angle(combined) + np.pi
+        gray_levels = (phase_pattern * 255 / (2 * np.pi)).astype(np.uint8)
 
-        k = np.fft.fftfreq(self.N, 1 / self.N)
-        Kx, Ky = np.meshgrid(k, k)
+        return gray_levels.flatten()
 
-        idx = 0
-        for m in range(self.N):
-            for n in range(self.N):
-                gx = -np.pi + (n + 1) * 2 * np.pi / self.N
-                gy = -np.pi + (m + 1) * 2 * np.pi / self.N
-                self.modes[:, :, idx] = gx * Kx + gy * Ky
-                idx += 1
-
-        print(f"Precomputed {self.N_modes} correction modes")
-
-    def _generate_slm_pattern(self, mode_idx: int, phase_step: int) -> np.ndarray:
-        """
-        生成SLM相位图案（DASH算法核心）
-        """
-        # 获取当前模式
-        Mn = self.modes[:, :, mode_idx]
-        theta_p = self.theta[phase_step]
-
-        # 生成DASH组合场（在矫正区域内）
-        modulated = np.sqrt(self.f) * np.exp(1j * (Mn + theta_p))
-        reference = np.sqrt(1 - self.f) * np.exp(1j * np.angle(self.C[:self.N, :self.N]))
-        combined = modulated + reference
-
-        # 提取相位
-        phase_pattern = np.angle(combined)
-
-        # 创建完整SLM图案（如果SLM大于矫正区域）
-        full_pattern = np.zeros((self.slm_height, self.slm_width))
-
-        # 将矫正图案放在SLM中心
-        y_start = (self.slm_height - self.N) // 2
-        x_start = (self.slm_width - self.N) // 2
-        full_pattern[y_start:y_start + self.N, x_start:x_start + self.N] = phase_pattern
-
-        return full_pattern
-
-    def _phase_to_gray(self, phase: np.ndarray) -> np.ndarray:
-        """
-        将相位转换为SLM灰度值
-        """
-        # 归一化到[0, 1]
-        normalized = (phase + np.pi) / (2 * np.pi)
-
-        # 转换为灰度值
-        if self.bit_depth == 8:
-            gray = (normalized * 255).astype(np.uint8)
-        elif self.bit_depth == 12:
-            # 12位深度，但通常以16位存储
-            gray = (normalized * 4095).astype(np.uint16)
-        elif self.bit_depth == 16:
-            gray = (normalized * 65535).astype(np.uint16)
-        else:
-            raise ValueError(f"Unsupported bit depth: {self.bit_depth}")
-
-        return gray
-
-    def _write_to_slm(self, phase_pattern: np.ndarray):
-        """
-        写入相位图案到SLM
-        """
-        # 转换为灰度值
-        gray = self._phase_to_gray(phase_pattern)
-
-        # 展平为一维数组（C顺序）
-        if self.bytes_per_pixel == 1:
-            self.slm_buffer[:] = gray.flatten()
-        else:  # 16位
-            gray_bytes = gray.astype(np.uint16).tobytes()
-            self.slm_buffer[:] = np.frombuffer(gray_bytes, dtype=np.uint8)
-
-        # 写入SLM
-        ret = self.slm_lib.Write_image(
+    def load_pattern_to_slm(self, pattern):
+        """Load single pattern to SLM"""
+        ret = self.slm_lib.Load_sequence(
             self.board_number,
-            self.slm_buffer.ctypes.data_as(POINTER(c_ubyte)),
-            len(self.slm_buffer),
-            self.wait_for_trigger,
-            self.flip_immediate,
-            self.output_pulse_flip,
-            self.output_pulse_refresh,
-            self.timeout_ms
+            pattern.ctypes.data_as(POINTER(c_ubyte)),
+            c_uint(self.image_size),
+            c_int(1),  # Single pattern
+            c_uint(1),  # Wait for trigger
+            c_uint(0),  # No immediate flip
+            c_uint(1),  # Output pulse on flip
+            c_uint(0),  # No refresh pulse
+            c_uint(1000)  # 1s timeout
         )
+        return ret != -1
 
-        if ret == -1:
-            raise RuntimeError("SLM DMA write failed")
+    def trigger_slm(self, trigger_task):
+        """Send trigger pulse to SLM"""
+        trigger_task.write(True)
+        time.sleep(0.001)
+        trigger_task.write(False)  # Falling edge triggers
+        time.sleep(0.001)
+        trigger_task.write(True)
 
-        # 等待图像写入完成
-        ret = self.slm_lib.ImageWriteComplete(self.board_number, self.timeout_ms)
-        if ret == -1:
-            raise RuntimeError("SLM ImageWriteComplete failed")
+    def acquire_pmt_signal(self, pmt_task):
+        """Acquire PMT signal for one integration period"""
+        # Read samples
+        data = pmt_task.read(number_of_samples_per_channel=self.integration_samples)
 
-    def _measure_signal(self, accumulation_time_ms: float = 1.0) -> float:
-        """
-        测量双光子荧光信号
-        """
-        if self.pmt is None:
-            # 模拟信号（用于测试）
-            return np.random.poisson(1000)
-        else:
-            # 实际PMT测量
-            return self.pmt.measure(accumulation_time_ms)
+        # Apply 50Hz notch filter
+        filtered = signal.filtfilt(self.notch_b, self.notch_a, data)
 
-    def _update_correction(self, mode_idx: int, signals: np.ndarray):
+        # Return mean value (integration)
+        return np.mean(filtered)
 
-        # 相位步进干涉测量
-        complex_sum = np.sum(np.sqrt(signals) * np.exp(-1j * self.theta))
+    def measure_mode(self, mode_idx, pmt_task, trigger_task):
+        """Measure single mode with phase stepping"""
+        intensities = np.zeros(self.n_phase_steps)
 
-        # 提取相位和幅度
-        phi_n = np.angle(complex_sum)
-        r_n = np.sqrt(np.sum(signals))
-        a_n = (1 / self.P) * np.abs(complex_sum) / r_n if r_n > 0 else 0
+        for p in range(self.n_phase_steps):
+            # Generate and load pattern
+            pattern = self.generate_mode_pattern(mode_idx, p)
+            if not self.load_pattern_to_slm(pattern):
+                print(f"Failed to load pattern for mode {mode_idx}, phase {p}")
+                continue
 
-        # 更新校正场（立即更新是DASH的关键）
-        Mn = self.modes[:, :, mode_idx]
+            # Trigger SLM
+            self.trigger_slm(trigger_task)
 
-        # 更新矫正区域
-        self.C[:self.N, :self.N] += a_n * np.exp(1j * (Mn - phi_n))
+            # Wait for pattern to stabilize
+            time.sleep(0.01)
 
-    def run_correction(self,
-                       iterations: int = 10,
-                       accumulation_time_ms: float = 1.0,
-                       save_progress: bool = True):
-        """
-        运行DASH矫正
-        Parameters:
-        -----------
-        iterations : int
-            迭代次数
-        accumulation_time_ms : float
-            每次测量的信号积累时间（毫秒）
-        save_progress : bool
-            是否保存进度数据
-        """
-        print(f"Starting DASH correction: {iterations} iterations, {self.N_modes} modes")
+            # Acquire signal
+            intensities[p] = self.acquire_pmt_signal(pmt_task)
 
-        # 记录增强因子
-        enhancement_history = []
+        # Calculate amplitude and phase from phase stepping
+        # Using formula from DASH paper
+        real_part = np.sum(intensities * np.cos(self.phase_values))
+        imag_part = np.sum(intensities * np.sin(self.phase_values))
 
-        try:
+        amplitude = 2 * np.sqrt(real_part ** 2 + imag_part ** 2) / self.n_phase_steps
+        phase = np.arctan2(imag_part, real_part)
+
+        return amplitude, phase, np.mean(intensities)
+
+    def update_correction(self, mode_idx, amplitude, phase):
+        """Update correction phase (DASH algorithm)"""
+        # Add weighted mode contribution to correction
+        self.correction_phase[mode_idx] = phase
+
+    def get_correction_pattern(self):
+        """Generate full correction pattern from mode phases"""
+        # Simplified - in reality would reconstruct full 2D pattern
+        # Here returning average phase for demonstration
+        return np.mean(self.correction_phase[:max(1, np.count_nonzero(self.correction_phase))])
+
+    def run_dash(self, iterations=3):
+        """Main DASH optimization loop"""
+        print("Starting DASH optimization...")
+
+        # Initialize hardware
+        if not self.init_slm():
+            return
+
+        # Storage for results
+        signals = np.zeros((iterations, self.n_modes))
+
+        # Setup DAQ tasks
+        with nidaqmx.Task() as pmt_task, nidaqmx.Task() as trigger_task:
+
+            # Configure PMT input
+            pmt_task.ai_channels.add_ai_voltage_chan(
+                f"{self.device_name}/{self.pmt_channel}",
+                terminal_config=TerminalConfiguration.PSEUDO_DIFF,
+                min_val=-10.0,
+                max_val=10.0
+            )
+            pmt_task.timing.cfg_samp_clk_timing(
+                rate=self.sample_rate,
+                sample_mode=AcquisitionType.FINITE,
+                samps_per_chan=self.integration_samples
+            )
+
+            # Configure trigger output
+            trigger_task.do_channels.add_do_chan(
+                f"{self.device_name}/{self.trigger_line}",
+                line_grouping=LineGrouping.CHAN_PER_LINE
+            )
+
+            # Main optimization loop
             for iteration in range(iterations):
                 print(f"\nIteration {iteration + 1}/{iterations}")
-                iteration_start = time.time()
 
-                for mode_idx in range(self.N_modes):
-                    # 对每个模式进行P次相位步进
-                    signals = np.zeros(self.P)
+                for mode in range(self.n_modes):
+                    # Measure mode response
+                    amplitude, phase, mean_signal = self.measure_mode(mode, pmt_task, trigger_task)
 
-                    for p in range(self.P):
-                        # 生成并写入SLM图案
-                        pattern = self._generate_slm_pattern(mode_idx, p)
-                        self._write_to_slm(pattern)
+                    # Store signal
+                    signals[iteration, mode] = mean_signal
 
-                        # 测量信号
-                        signals[p] = self._measure_signal(accumulation_time_ms)
+                    # Update correction (DASH continuous update)
+                    self.update_correction(mode, amplitude, phase)
 
-                    # 立即更新校正
-                    self._update_correction(mode_idx, signals)
+                    # Progress indicator
+                    if mode % 15 == 0:
+                        print(f"  Mode {mode}/{self.n_modes}, Signal: {mean_signal:.3f}")
 
-                    # 计算当前增强因子（可选）
-                    if mode_idx % 10 == 0:
-                        current_enhancement = np.mean(signals) / 1000  # 相对于初始信号
-                        enhancement_history.append(current_enhancement)
-                        print(f"  Mode {mode_idx + 1}/{self.N_modes}, Enhancement: {current_enhancement:.2f}")
+        # Cleanup
+        self.slm_lib.Delete_SDK()
 
-                iteration_time = time.time() - iteration_start
-                print(f"  Iteration completed in {iteration_time:.1f} seconds")
+        return signals
 
-                # 保存中间结果
-                if save_progress:
-                    np.save(f'correction_iter_{iteration + 1}.npy', np.angle(self.C))
+    def plot_results(self, signals):
+        """Plot optimization progress"""
+        plt.figure(figsize=(10, 6))
 
-        except KeyboardInterrupt:
-            print("\nCorrection interrupted by user")
-        finally:
-            # 返回最终校正相位
-            final_correction = np.angle(self.C)
+        # Flatten signals for plotting
+        flat_signals = signals.flatten()
+        measurements = np.arange(len(flat_signals))
 
-            # 保存最终结果
-            if save_progress:
-                np.save('final_correction.npy', final_correction)
-                np.save('enhancement_history.npy', enhancement_history)
+        plt.plot(measurements, flat_signals, 'b-', linewidth=0.8)
+        plt.xlabel('Measurement Number')
+        plt.ylabel('PMT Signal (V)')
+        plt.title('DASH Optimization Progress')
+        plt.grid(True, alpha=0.3)
 
-            return final_correction, enhancement_history
+        # Mark iteration boundaries
+        for i in range(signals.shape[0]):
+            plt.axvline(i * self.n_modes, color='r', linestyle='--', alpha=0.5)
 
-    def apply_correction_only(self):
-        """
-        只应用校正（不进行模式测试）
-        """
-        correction_phase = np.angle(self.C)
-        self._write_to_slm(correction_phase)
-        print("Correction applied to SLM")
-
-    def cleanup(self):
-        """
-        清理资源
-        """
-        if hasattr(self, 'slm_lib'):
-            self.slm_lib.Delete_SDK()
-            print("SLM SDK cleaned up")
+        plt.tight_layout()
+        plt.show()
 
 
-# PMT接口示例（需要根据实际硬件实现）
-class PMT_Interface:
-    """
-    PMT接口示例
-    """
-
-    def __init__(self, device_name: str = "Dev1/ai0"):
-        # 这里使用NI DAQ作为示例
-        # 实际使用时需要安装nidaqmx: pip install nidaqmx
-        try:
-            import nidaqmx
-            self.device = device_name
-            self.task = None
-        except ImportError:
-            print("Warning: nidaqmx not installed, using simulated signals")
-            self.device = None
-
-    def measure(self, accumulation_time_ms: float) -> float:
-        """
-        测量光子计数
-        """
-        if self.device is None:
-            # 模拟信号
-            return np.random.poisson(1000 * accumulation_time_ms)
-        else:
-            # 实际DAQ测量
-            import nidaqmx
-            with nidaqmx.Task() as task:
-                task.ai_channels.add_ai_voltage_chan(self.device)
-                task.timing.cfg_samp_clk_timing(
-                    rate=10000,  # 10kHz采样率
-                    sample_mode=nidaqmx.constants.AcquisitionType.FINITE,
-                    samps_per_chan=int(10 * accumulation_time_ms)
-                )
-                data = task.read(number_of_samples_per_channel=int(10 * accumulation_time_ms))
-
-                # 转换为光子计数（需要根据PMT校准）
-                photon_count = np.sum(data > 0.5)  # 简单阈值
-                return photon_count
-
-
-# 使用示例
 def main():
-    """
-    主程序
-    """
-    # 初始化PMT
-    pmt = PMT_Interface()
+    """Run DASH optimization"""
+    dash = DASH_System()
 
-    # 初始化DASH系统
-    dash = DASH_Meadowlark_System(
-        pmt_device=pmt,
-        N_modes=225,  # 15x15模式
-        f=0.3,
-        P=5
-    )
+    # Run optimization
+    signals = dash.run_dash(iterations=3)
 
-    try:
-        # 运行矫正
-        correction, history = dash.run_correction(
-            iterations=10,
-            accumulation_time_ms=1.0,  # 1ms积累时间
-            save_progress=True
-        )
+    # Plot results
+    dash.plot_results(signals)
 
-        # 应用最终校正
-        dash.apply_correction_only()
-
-        print("\nCorrection completed!")
-        print(f"Final enhancement: {history[-1]:.2f}x")
-
-    finally:
-        # 清理
-        dash.cleanup()
+    # Print statistics
+    print(f"\nOptimization complete")
+    print(f"Initial signal: {np.mean(signals[0, :5]):.3f} V")
+    print(f"Final signal: {np.mean(signals[-1, -5:]):.3f} V")
+    print(f"Enhancement: {np.mean(signals[-1, -5:]) / np.mean(signals[0, :5]):.1f}x")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
-SLM Response Time Test - Direct Time Recording
-Record PMT signal and trigger events with millisecond timestamps
+SLM Response Time Test - Using BMP Files
+Record PMT signal and trigger events with actual Meadowlark images
 """
 
 import numpy as np
@@ -33,13 +33,14 @@ class SLM_PMT_Recorder:
 
         # Recording parameters
         self.sample_rate = 10000  # Hz
+        self.sample_period = 1.0 / self.sample_rate  # seconds
 
-        # Data storage with timestamps
-        self.pmt_data = []  # (time_ms, voltage)
-        self.trigger_events = []  # (time_ms, event_type)
+        # Data storage
+        self.pmt_data = []
+        self.trigger_events = []  # (sample_index, event_type)
+        self.current_sample = 0
         self.recording = False
         self.recording_lock = threading.Lock()
-        self.test_start_time = None
 
         # Image paths
         self.image_paths = [
@@ -82,10 +83,11 @@ class SLM_PMT_Recorder:
 
         # Load each BMP file
         for i, image_path in enumerate(self.image_paths[:self.num_patterns]):
+            # Extract filename for display
             filename = os.path.basename(image_path)
             print(f"  Loading: {filename}")
 
-            # Load image
+            # Load image (following reference code method)
             img = PILImage.open(image_path)
             img_array = np.array(img.convert('L'), dtype=np.uint8)
 
@@ -126,7 +128,7 @@ class SLM_PMT_Recorder:
     def start_recording(self):
         """Start PMT recording thread"""
         self.recording = True
-        self.test_start_time = time.perf_counter()
+        self.current_sample = 0
         thread = threading.Thread(target=self._recording_thread)
         thread.daemon = True
         thread.start()
@@ -134,7 +136,7 @@ class SLM_PMT_Recorder:
         print("PMT recording started")
 
     def _recording_thread(self):
-        """Continuous PMT recording with timestamps"""
+        """Continuous PMT recording"""
         with nidaqmx.Task() as task:
             task.ai_channels.add_ai_voltage_chan(
                 f"{self.device_name}/{self.pmt_channel}",
@@ -154,16 +156,9 @@ class SLM_PMT_Recorder:
             while self.recording:
                 try:
                     data = task.read(number_of_samples_per_channel=100, timeout=0.1)
-                    current_time = time.perf_counter()
-
-                    # Calculate timestamp for each sample
                     with self.recording_lock:
-                        for i, value in enumerate(data):
-                            # Calculate precise timestamp for each sample
-                            time_ms = (current_time - self.test_start_time) * 1000 - (len(data) - i - 1) * (
-                                        1000.0 / self.sample_rate)
-                            self.pmt_data.append((time_ms, value))
-
+                        self.pmt_data.extend(data)
+                        self.current_sample += len(data)
                 except nidaqmx.errors.DaqError:
                     continue
 
@@ -213,23 +208,23 @@ class SLM_PMT_Recorder:
             thread.start()
             time.sleep(0.01)
 
-            # Record trigger sent time
-            trigger_sent_time = (time.perf_counter() - self.test_start_time) * 1000  # ms
+            # Record trigger sent sample
             with self.recording_lock:
-                self.trigger_events.append((trigger_sent_time, 'TRIGGER_SENT'))
+                trigger_sent_sample = self.current_sample
+                self.trigger_events.append((trigger_sent_sample, 'TRIGGER_SENT'))
 
             # Send trigger (falling edge)
             trigger_task.write(False)
 
             # Monitor feedback
             feedback_received = False
-            start_monitor = time.perf_counter()
+            start_time = time.perf_counter()
 
-            while time.perf_counter() - start_monitor < 1.0:
+            while time.perf_counter() - start_time < 1.0:
                 if feedback_task.read():
-                    feedback_time = (time.perf_counter() - self.test_start_time) * 1000  # ms
                     with self.recording_lock:
-                        self.trigger_events.append((feedback_time, 'FEEDBACK_RECEIVED'))
+                        feedback_sample = self.current_sample
+                        self.trigger_events.append((feedback_sample, 'FEEDBACK_RECEIVED'))
                     feedback_received = True
                     break
                 time.sleep(0.00001)
@@ -262,7 +257,7 @@ class SLM_PMT_Recorder:
         input("\nAdjust sample and laser, press Enter to start...")
 
         # Start recording
-        test_start_datetime = datetime.now()
+        test_start = datetime.now()
         self.start_recording()
 
         # Perform switches
@@ -294,7 +289,7 @@ class SLM_PMT_Recorder:
         time.sleep(0.5)
 
         # Save data and plot
-        self.save_data(test_start_datetime)
+        self.save_data(test_start)
         self.plot_pmt_signal()
 
         # Cleanup
@@ -302,7 +297,7 @@ class SLM_PMT_Recorder:
         print("\nTest completed")
 
     def save_data(self, test_start):
-        """Save PMT data and trigger events with timestamps"""
+        """Save PMT data and trigger events"""
         timestamp = test_start.strftime("%Y%m%d_%H%M%S")
 
         # Save PMT data
@@ -312,18 +307,19 @@ class SLM_PMT_Recorder:
             f.write(f"# PMT Recording Data\n")
             f.write(f"# Test Start: {test_start}\n")
             f.write(f"# Sample Rate: {self.sample_rate} Hz\n")
+            f.write(f"# Sample Period: {self.sample_period * 1000:.3f} ms\n")
             f.write(f"# Total Samples: {len(self.pmt_data)}\n")
-            f.write(f"# Total Duration: {self.pmt_data[-1][0] if self.pmt_data else 0:.3f} ms\n")
+            f.write(f"# Total Duration: {len(self.pmt_data) / self.sample_rate:.3f} seconds\n")
             f.write(f"# Number of Patterns: {self.num_patterns}\n")
 
             # Image names
             image_names = [os.path.basename(p) for p in self.image_paths[:self.num_patterns]]
             f.write(f"# Images: {', '.join(image_names)}\n")
             f.write("#\n")
-            f.write("# Time_ms\tPMT_Voltage\n")
+            f.write("# Sample_Index\tPMT_Voltage\n")
 
-            for time_ms, value in self.pmt_data:
-                f.write(f"{time_ms:.3f}\t{value:.6f}\n")
+            for i, value in enumerate(self.pmt_data):
+                f.write(f"{i}\t{value:.6f}\n")
 
         print(f"PMT data saved: {pmt_filename}")
 
@@ -333,18 +329,20 @@ class SLM_PMT_Recorder:
             f.write(f"# Trigger Events\n")
             f.write(f"# Test Start: {test_start}\n")
             f.write(f"# Sample Rate: {self.sample_rate} Hz\n")
+            f.write(f"# Sample Period: {self.sample_period * 1000:.3f} ms\n")
             f.write(f"#\n")
-            f.write("# Time_ms\tEvent_Type\n")
+            f.write("# Sample_Index\tEvent_Type\tTime_ms\n")
 
-            for time_ms, event_type in self.trigger_events:
-                f.write(f"{time_ms:.3f}\t{event_type}\n")
+            for sample_idx, event_type in self.trigger_events:
+                time_ms = sample_idx * self.sample_period * 1000
+                f.write(f"{sample_idx}\t{event_type}\t{time_ms:.3f}\n")
 
         print(f"Trigger events saved: {trigger_filename}")
 
         # Print summary
         print(f"\nRecording Summary:")
         print(f"  Total samples: {len(self.pmt_data)}")
-        print(f"  Duration: {self.pmt_data[-1][0] / 1000:.2f} seconds" if self.pmt_data else "  Duration: 0 seconds")
+        print(f"  Duration: {len(self.pmt_data) / self.sample_rate:.2f} seconds")
         print(f"  Trigger events: {len(self.trigger_events)}")
 
     def plot_pmt_signal(self):
@@ -355,34 +353,34 @@ class SLM_PMT_Recorder:
 
         print("\nPlotting PMT signal...")
 
-        # Extract times and voltages
-        times_ms = np.array([t for t, v in self.pmt_data])
-        pmt_voltages = np.array([v for t, v in self.pmt_data])
-        times_s = times_ms / 1000.0  # Convert to seconds for plotting
+        # Create sample indices and time array
+        samples = np.arange(len(self.pmt_data))
+        times = samples * self.sample_period
+        pmt = np.array(self.pmt_data)
 
         # Create figure
         fig, ax = plt.subplots(figsize=(14, 6))
 
         # Plot PMT signal
-        ax.plot(times_s, pmt_voltages, 'b-', linewidth=0.5, alpha=0.8)
+        ax.plot(times, pmt, 'b-', linewidth=0.5, alpha=0.8)
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('PMT Signal (V)')
         ax.set_title(f'PMT Signal Recording - {self.num_patterns} Patterns')
         ax.grid(True, alpha=0.3)
 
         # Mark trigger events
-        for time_ms, event_type in self.trigger_events:
-            t_s = time_ms / 1000.0
+        for sample_idx, event_type in self.trigger_events:
+            t = sample_idx * self.sample_period
             if event_type == 'TRIGGER_SENT':
-                ax.axvline(t_s, color='red', linestyle='--', alpha=0.6, linewidth=1)
+                ax.axvline(t, color='red', linestyle='--', alpha=0.6, linewidth=1)
             elif event_type == 'FEEDBACK_RECEIVED':
-                ax.axvline(t_s, color='green', linestyle='--', alpha=0.6, linewidth=1)
+                ax.axvline(t, color='green', linestyle='--', alpha=0.6, linewidth=1)
 
         # Add legend
         ax.axvline(-1000, color='red', linestyle='--', label='Trigger Sent')
         ax.axvline(-1000, color='green', linestyle='--', label='Feedback Received')
         ax.legend(loc='upper right')
-        ax.set_xlim(0, times_s[-1])
+        ax.set_xlim(0, times[-1])
 
         plt.tight_layout()
 
